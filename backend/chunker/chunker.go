@@ -217,6 +217,20 @@ It has the following fields: ver, size, nchunks, md5, sha1.`,
 					Help:  "Warn user, skip incomplete file and proceed.",
 				},
 			},
+		}, {
+			Name:     "attempt_resume",
+			Advanced: true,
+			Default:  false,
+			Help:     `Choose if chunker should attempt to resume a failed upload`,
+			Examples: []fs.OptionExample{
+				{
+					Value: "true",
+					Help:  "Checks for existing chunks from a failed uplaod for the file and skips over them if found.",
+				}, {
+					Value: "false",
+					Help:  "Always uploads all chunks, ignoring existing chunks if present.",
+				},
+			},
 		}},
 	})
 }
@@ -296,13 +310,14 @@ func NewFs(name, rpath string, m configmap.Mapper) (fs.Fs, error) {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Remote     string        `config:"remote"`
-	ChunkSize  fs.SizeSuffix `config:"chunk_size"`
-	NameFormat string        `config:"name_format"`
-	StartFrom  int           `config:"start_from"`
-	MetaFormat string        `config:"meta_format"`
-	HashType   string        `config:"hash_type"`
-	FailHard   bool          `config:"fail_hard"`
+	Remote        string        `config:"remote"`
+	ChunkSize     fs.SizeSuffix `config:"chunk_size"`
+	NameFormat    string        `config:"name_format"`
+	StartFrom     int           `config:"start_from"`
+	MetaFormat    string        `config:"meta_format"`
+	HashType      string        `config:"hash_type"`
+	FailHard      bool          `config:"fail_hard"`
+	AttemptResume bool          `config:"attempt_resume"`
 }
 
 // Fs represents a wrapped fs.Fs
@@ -933,6 +948,32 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 		return nil, errXact
 	}
 
+	// Gets a list of existing files in the directory
+	existingChunks := make(map[int]string) //map to keep track of existing chunks that are found (map is being used more like a set, but sets aren't supported in Go)
+	if f.opt.AttemptResume {
+		fs.Debugf(f, "Attempting Resume with chunker root:%s    base root:%s", f.Root(), f.base.Root())
+		entries, errList := f.base.List(ctx, "")
+		if errList != nil {
+			return nil, errList
+		}
+		fs.Debugf(f, "Number of existing files in directory:%d", entries.Len())
+		for i := 0; i < entries.Len(); i++ {
+			fileName := entries[i].String()
+			fileSize := entries[i].Size()
+			modTime := entries[i].ModTime(ctx)
+			parentFilePath, chunkNo, _, _ := f.parseChunkName(fileName) //can also get xactID here if needed
+			dt := src.ModTime(ctx).Sub(modTime)
+			modifyWindow := fs.GetModifyWindow(src.Fs(), f.base)
+
+			//checks if chunk belongs to equivalent file
+			//currently checks by name, size, and mod time
+			if parentFilePath == baseRemote && c.chunkSize == fileSize && dt < modifyWindow && dt > -modifyWindow {
+				existingChunks[chunkNo] = fileName
+			}
+		}
+
+	}
+
 	// Transfer chunks data
 	for c.chunkNo = 0; !c.done; c.chunkNo++ {
 		if c.chunkNo > maxSafeChunkNumber {
@@ -953,10 +994,30 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 		}
 		info := f.wrapInfo(src, chunkRemote, size)
 
-		// TODO: handle range/limit options
-		chunk, errChunk := basePut(ctx, wrapIn, info, options...)
-		if errChunk != nil {
-			return nil, errChunk
+		existingChunkPath := existingChunks[c.chunkNo]
+		var chunk fs.Object
+		// Checks if there was an existing chunk of this chunkNo found
+		// Existing chunk will be included if it exists, else the chunk will be uploaded
+		if existingChunkPath != "" && f.opt.AttemptResume {
+			fs.Debugf(f, "Chunk %d found. Skipping chunk...", c.chunkNo)
+			existingChunk, errExistingChunk := f.base.NewObject(ctx, existingChunkPath)
+			if errExistingChunk != nil {
+				return nil, errExistingChunk
+			}
+			chunk = existingChunk
+
+			// Need to force Read here to update accounting, hashsums, and advance the Reader for the skipped chunk
+			if err := c.dummyRead(wrapIn, size); err != nil {
+				return nil, err
+			}
+
+		} else {
+			// TODO: handle range/limit options
+			uploadedChunk, errChunk := basePut(ctx, wrapIn, info, options...)
+			if errChunk != nil {
+				return nil, errChunk
+			}
+			chunk = uploadedChunk
 		}
 
 		if size > 0 && c.readCount == savedReadCount && c.expectSingle {
@@ -994,6 +1055,7 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 		c.chunkLimit = c.chunkSize
 
 		c.chunks = append(c.chunks, chunk)
+		fs.Debugf(f, "Added Chunk: %d", c.chunkNo)
 	}
 
 	// Validate uploaded size
@@ -1199,7 +1261,7 @@ func (c *chunkingReader) accountBytes(bytesRead int64) {
 
 // dummyRead updates accounting, hashsums etc by simulating reads
 func (c *chunkingReader) dummyRead(in io.Reader, size int64) error {
-	if c.hasher == nil && c.readCount+size > maxMetadataSize {
+	if c.hasher == nil && c.readCount+size > maxMetadataSize && !c.fs.opt.AttemptResume { //TODO: Added "&& !f.opt.AttemptResume" so that full dummy read would always occur, but need to investigate furhter why this if statement was here and if there could be confilicts with this change
 		c.accountBytes(size)
 		return nil
 	}
@@ -1210,7 +1272,7 @@ func (c *chunkingReader) dummyRead(in io.Reader, size int64) error {
 		if n > bufLen {
 			n = bufLen
 		}
-		if _, err := io.ReadFull(in, buf[0:n]); err != nil {
+		if _, err := io.ReadFull(in, buf[0:n]); err != nil { // TODO: time intensive for skipping existing chunks
 			return err
 		}
 		size -= n
