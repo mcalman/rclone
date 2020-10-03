@@ -920,7 +920,6 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 			chunk = existingChunk
 
 			// Need to force Read here to update accounting, hashsums, and advance the Reader for the skipped chunk
-			fs.Debugf(f, "SIZE FOR DUMMY READ:%d", size)
 			if err := c.dummyRead(wrapIn, size); err != nil {
 				return nil, err
 			}
@@ -932,44 +931,44 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 				return nil, errChunk
 			}
 			chunk = uploadedChunk
-
-			if size > 0 && c.readCount == savedReadCount && c.expectSingle {
-				// basePut returned success but didn't call chunkingReader's Read.
-				// This is possible if wrapped remote has performed the put by hash
-				// because chunker bridges Hash from source for non-chunked files.
-				// Hence, force Read here to update accounting and hashsums.
-				if err := c.dummyRead(wrapIn, size); err != nil {
-					return nil, err
-				}
-			}
-			if c.sizeLeft == 0 && !c.done {
-				// The file has been apparently put by hash, force completion.
-				c.done = true
-			}
-
-			// Expected a single chunk but more to come, so name it as usual.
-			if !c.done && chunkRemote != tempRemote {
-				fs.Infof(chunk, "Expected single chunk, got more")
-				chunkMoved, errMove := f.baseMove(ctx, chunk, tempRemote, delFailed)
-				if errMove != nil {
-					silentlyRemove(ctx, chunk)
-					return nil, errMove
-				}
-				chunk = chunkMoved
-			}
-
-			// Wrapped remote may or may not have seen EOF from chunking reader,
-			// eg. the box multi-uploader reads exactly the chunk size specified
-			// and skips the "EOF" read. Hence, switch to next limit here.
-			if !(c.chunkLimit == 0 || c.chunkLimit == c.chunkSize || c.sizeTotal == -1 || c.done) {
-				silentlyRemove(ctx, chunk)
-				return nil, fmt.Errorf("Destination ignored %d data bytes", c.chunkLimit)
-			}
-			c.chunkLimit = c.chunkSize
-
-			c.chunks = append(c.chunks, chunk)
-			fs.Debugf(f, "Added Chunk: %d", c.chunkNo)
 		}
+		if size > 0 && c.readCount == savedReadCount && c.expectSingle {
+			// basePut returned success but didn't call chunkingReader's Read.
+			// This is possible if wrapped remote has performed the put by hash
+			// because chunker bridges Hash from source for non-chunked files.
+			// Hence, force Read here to update accounting and hashsums.
+			if err := c.dummyRead(wrapIn, size); err != nil {
+				return nil, err
+			}
+		}
+		if c.sizeLeft == 0 && !c.done {
+			// The file has been apparently put by hash, force completion.
+			c.done = true
+		}
+
+		// Expected a single chunk but more to come, so name it as usual.
+		if !c.done && chunkRemote != tempRemote {
+			fs.Infof(chunk, "Expected single chunk, got more")
+			chunkMoved, errMove := f.baseMove(ctx, chunk, tempRemote, delFailed)
+			if errMove != nil {
+				silentlyRemove(ctx, chunk)
+				return nil, errMove
+			}
+			chunk = chunkMoved
+		}
+
+		// Wrapped remote may or may not have seen EOF from chunking reader,
+		// eg. the box multi-uploader reads exactly the chunk size specified
+		// and skips the "EOF" read. Hence, switch to next limit here.
+		if !(c.chunkLimit == 0 || c.chunkLimit == c.chunkSize || c.sizeTotal == -1 || c.done) {
+			silentlyRemove(ctx, chunk)
+			return nil, fmt.Errorf("Destination ignored %d data bytes", c.chunkLimit)
+		}
+		c.chunkLimit = c.chunkSize
+
+		c.chunks = append(c.chunks, chunk)
+		fs.Debugf(f, "Added Chunk: %d", c.chunkNo)
+
 	}
 
 	// Validate uploaded size
