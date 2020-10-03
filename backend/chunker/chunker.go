@@ -850,15 +850,14 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 	}()
 
 	baseRemote := remote
+
 	statusChunkName := f.makeChunkName(baseRemote, -1, "status")
 	var statusObject fs.Object
-	if err == nil {
-		statusInfo := f.wrapInfo(src, statusChunkName, 0)
-		var basePutErr error
-		statusObject, basePutErr = basePut(ctx, bytes.NewReader([]byte{}), statusInfo)
-		if basePutErr != nil {
-			return nil, basePutErr
-		}
+	statusInfo := f.wrapInfo(src, statusChunkName, 0)
+	var basePutErr error
+	statusObject, basePutErr = basePut(ctx, bytes.NewReader([]byte{}), statusInfo)
+	if basePutErr != nil {
+		return nil, basePutErr
 	}
 
 	// Gets a list of existing files in the directory
