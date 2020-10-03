@@ -12,13 +12,11 @@ import (
 	gohash "hash"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -53,14 +51,9 @@ import (
 // An operation creates temporary chunks while it runs.
 // By completion it removes temporary and leaves active chunks.
 //
-// Temporary chunks have a special hardcoded suffix in addition
-// to the configured name pattern.
-// Temporary suffix includes so called transaction identifier
-// (abbreviated as `xactID` below), a generic non-negative base-36 "number"
-// used by parallel operations to share a composite object.
-// Chunker also accepts the longer decimal temporary suffix (obsolete),
-// which is transparently converted to the new format. In its maximum
-// length of 13 decimals it makes a 7-digit base-36 number.
+// Temporary chunks can be identified by the presence of a "status"
+// control chunk which is uploaded at the start of an upload and
+// removed upon the successful upload of the last data chunk
 //
 // Chunker can tell data chunks from control chunks by the characters
 // located in the "hash placeholder" position of configured format.
@@ -68,21 +61,13 @@ import (
 // Control chunks have in that position a short lowercase alphanumeric
 // string (starting with a letter) prepended by underscore.
 //
-// Metadata format v1 does not define any control chunk types,
-// they are currently ignored aka reserved.
-// In future they can be used to implement resumable uploads etc.
-//
 const (
-	ctrlTypeRegStr   = `[a-z][a-z0-9]{2,6}`
-	tempSuffixFormat = `_%04s`
-	tempSuffixRegStr = `_([0-9a-z]{4,9})`
-	tempSuffixRegOld = `\.\.tmp_([0-9]{10,13})`
+	ctrlTypeRegStr = `[a-z][a-z0-9]{2,6}`
 )
 
 var (
 	// regular expressions to validate control type and temporary suffix
-	ctrlTypeRegexp   = regexp.MustCompile(`^` + ctrlTypeRegStr + `$`)
-	tempSuffixRegexp = regexp.MustCompile(`^` + tempSuffixRegStr + `$`)
+	ctrlTypeRegexp = regexp.MustCompile(`^` + ctrlTypeRegStr + `$`)
 )
 
 // Normally metadata is a small piece of JSON (about 100-300 bytes).
@@ -217,6 +202,20 @@ It has the following fields: ver, size, nchunks, md5, sha1.`,
 					Help:  "Warn user, skip incomplete file and proceed.",
 				},
 			},
+		}, {
+			Name:     "attempt_resume",
+			Advanced: true,
+			Default:  false,
+			Help:     `Choose if chunker should attempt to resume a failed upload`,
+			Examples: []fs.OptionExample{
+				{
+					Value: "true",
+					Help:  "Checks for existing chunks from a failed uplaod for the file and skips over them if found.",
+				}, {
+					Value: "false",
+					Help:  "Always uploads all chunks, ignoring existing chunks if present.",
+				},
+			},
 		}},
 	})
 }
@@ -270,7 +269,7 @@ func NewFs(name, rpath string, m configmap.Mapper) (fs.Fs, error) {
 	// detects a composite file because it finds the first chunk!
 	// (yet can't satisfy fstest.CheckListing, will ignore)
 	if err == nil && !f.useMeta && strings.Contains(rpath, "/") {
-		firstChunkPath := f.makeChunkName(remotePath, 0, "", "")
+		firstChunkPath := f.makeChunkName(remotePath, 0, "")
 		_, testErr := baseInfo.NewFs(baseName, firstChunkPath, baseConfig)
 		if testErr == fs.ErrorIsFile {
 			err = testErr
@@ -296,13 +295,14 @@ func NewFs(name, rpath string, m configmap.Mapper) (fs.Fs, error) {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Remote     string        `config:"remote"`
-	ChunkSize  fs.SizeSuffix `config:"chunk_size"`
-	NameFormat string        `config:"name_format"`
-	StartFrom  int           `config:"start_from"`
-	MetaFormat string        `config:"meta_format"`
-	HashType   string        `config:"hash_type"`
-	FailHard   bool          `config:"fail_hard"`
+	Remote        string        `config:"remote"`
+	ChunkSize     fs.SizeSuffix `config:"chunk_size"`
+	NameFormat    string        `config:"name_format"`
+	StartFrom     int           `config:"start_from"`
+	MetaFormat    string        `config:"meta_format"`
+	HashType      string        `config:"hash_type"`
+	FailHard      bool          `config:"fail_hard"`
+	AttemptResume bool          `config:"attempt_resume"`
 }
 
 // Fs represents a wrapped fs.Fs
@@ -319,8 +319,6 @@ type Fs struct {
 	dataNameFmt  string         // name format of data chunks
 	ctrlNameFmt  string         // name format of control chunks
 	nameRegexp   *regexp.Regexp // regular expression to match chunk names
-	xactIDRand   *rand.Rand     // generator of random transaction identifiers
-	xactIDMutex  sync.Mutex     // mutex for the source of randomness
 	opt          Options        // copy of Options
 	features     *fs.Features   // optional features
 	dirSort      bool           // reserved for future, ignored
@@ -339,10 +337,6 @@ func (f *Fs) configure(nameFormat, metaFormat, hashType string) error {
 	if err := f.setHashType(hashType); err != nil {
 		return err
 	}
-
-	randomSeed := time.Now().UnixNano()
-	f.xactIDRand = rand.New(rand.NewSource(randomSeed))
-
 	return nil
 }
 
@@ -437,7 +431,7 @@ func (f *Fs) setChunkNameFormat(pattern string) error {
 	strRegex := regexp.QuoteMeta(pattern)
 	strRegex = reHashes.ReplaceAllLiteralString(strRegex, reDataOrCtrl)
 	strRegex = strings.Replace(strRegex, "\\*", mainNameRegStr, -1)
-	strRegex = fmt.Sprintf("^%s(?:%s|%s)?$", strRegex, tempSuffixRegStr, tempSuffixRegOld)
+	strRegex = fmt.Sprintf("^%s$", strRegex)
 	f.nameRegexp = regexp.MustCompile(strRegex)
 
 	// craft printf formats for active data/control chunks
@@ -461,12 +455,9 @@ func (f *Fs) setChunkNameFormat(pattern string) error {
 // ctrlType is type of control chunk (must be valid).
 // ctrlType must be "" for data chunks.
 //
-// xactID is a transaction identifier. Empty xactID denotes active chunk,
-// otherwise temporary chunk name is produced.
-//
-func (f *Fs) makeChunkName(filePath string, chunkNo int, ctrlType, xactID string) string {
+func (f *Fs) makeChunkName(filePath string, chunkNo int, ctrlType string) string {
 	dir, parentName := path.Split(filePath)
-	var name, tempSuffix string
+	var name string
 	switch {
 	case chunkNo >= 0 && ctrlType == "":
 		name = fmt.Sprintf(f.dataNameFmt, parentName, chunkNo+f.opt.StartFrom)
@@ -475,13 +466,7 @@ func (f *Fs) makeChunkName(filePath string, chunkNo int, ctrlType, xactID string
 	default:
 		panic("makeChunkName: invalid argument") // must not produce something we can't consume
 	}
-	if xactID != "" {
-		tempSuffix = fmt.Sprintf(tempSuffixFormat, xactID)
-		if !tempSuffixRegexp.MatchString(tempSuffix) {
-			panic("makeChunkName: invalid argument")
-		}
-	}
-	return dir + name + tempSuffix
+	return dir + name
 }
 
 // parseChunkName checks whether given file path belongs to
@@ -497,13 +482,11 @@ func (f *Fs) makeChunkName(filePath string, chunkNo int, ctrlType, xactID string
 //
 // data chunk - the returned chunkNo is non-negative and ctrlType is ""
 // control chunk - the chunkNo is -1 and ctrlType is a non-empty string
-// active chunk - the returned xactID is ""
-// temporary chunk - the xactID is a non-empty string
-func (f *Fs) parseChunkName(filePath string) (parentPath string, chunkNo int, ctrlType, xactID string) {
+func (f *Fs) parseChunkName(filePath string) (parentPath string, chunkNo int, ctrlType string) {
 	dir, name := path.Split(filePath)
 	match := f.nameRegexp.FindStringSubmatch(name)
 	if match == nil || match[1] == "" {
-		return "", -1, "", ""
+		return "", -1, ""
 	}
 	var err error
 
@@ -514,23 +497,8 @@ func (f *Fs) parseChunkName(filePath string) (parentPath string, chunkNo int, ct
 		}
 		if chunkNo -= f.opt.StartFrom; chunkNo < 0 {
 			fs.Infof(f, "invalid data chunk number in file %q", name)
-			return "", -1, "", ""
+			return "", -1, ""
 		}
-	}
-
-	if match[4] != "" {
-		xactID = match[4]
-	}
-	if match[5] != "" {
-		// old-style temporary suffix
-		number, err := strconv.ParseInt(match[5], 10, 64)
-		if err != nil || number < 0 {
-			fs.Infof(f, "invalid old-style transaction number in file %q", name)
-			return "", -1, "", ""
-		}
-		// convert old-style transaction number to base-36 transaction ID
-		xactID = fmt.Sprintf(tempSuffixFormat, strconv.FormatInt(number, 36))
-		xactID = xactID[1:] // strip leading underscore
 	}
 
 	parentPath = dir + match[1]
@@ -541,7 +509,7 @@ func (f *Fs) parseChunkName(filePath string) (parentPath string, chunkNo int, ct
 // forbidChunk prints error message or raises error if file is chunk.
 // First argument sets log prefix, use `false` to suppress message.
 func (f *Fs) forbidChunk(o interface{}, filePath string) error {
-	if parentPath, _, _, _ := f.parseChunkName(filePath); parentPath != "" {
+	if parentPath, _, _ := f.parseChunkName(filePath); parentPath != "" {
 		if f.opt.FailHard {
 			return fmt.Errorf("chunk overlap with %q", parentPath)
 		}
@@ -550,63 +518,6 @@ func (f *Fs) forbidChunk(o interface{}, filePath string) error {
 		}
 	}
 	return nil
-}
-
-// newXactID produces a sufficiently random transaction identifier.
-//
-// The temporary suffix mask allows identifiers consisting of 4-9
-// base-36 digits (ie. digits 0-9 or lowercase letters a-z).
-// The identifiers must be unique between transactions running on
-// the single file in parallel.
-//
-// Currently the function produces 6-character identifiers.
-// Together with underscore this makes a 7-character temporary suffix.
-//
-// The first 4 characters isolate groups of transactions by time intervals.
-// The maximum length of interval is base-36 "zzzz" ie. 1,679,615 seconds.
-// The function rather takes a maximum prime closest to this number
-// (see https://primes.utm.edu) as the interval length to better safeguard
-// against repeating pseudo-random sequences in cases when rclone is
-// invoked from a periodic scheduler like unix cron.
-// Thus, the interval is slightly more than 19 days 10 hours 33 minutes.
-//
-// The remaining 2 base-36 digits (in the range from 0 to 1295 inclusive)
-// are taken from the local random source.
-// This provides about 0.1% collision probability for two parallel
-// operations started at the same second and working on the same file.
-//
-// Non-empty filePath argument enables probing for existing temporary chunk
-// to further eliminate collisions.
-func (f *Fs) newXactID(ctx context.Context, filePath string) (xactID string, err error) {
-	const closestPrimeZzzzSeconds = 1679609
-	const maxTwoBase36Digits = 1295
-
-	unixSec := time.Now().Unix()
-	if unixSec < 0 {
-		unixSec = -unixSec // unlikely but the number must be positive
-	}
-	circleSec := unixSec % closestPrimeZzzzSeconds
-	first4chars := strconv.FormatInt(circleSec, 36)
-
-	for tries := 0; tries < maxTransactionProbes; tries++ {
-		f.xactIDMutex.Lock()
-		randomness := f.xactIDRand.Int63n(maxTwoBase36Digits + 1)
-		f.xactIDMutex.Unlock()
-
-		last2chars := strconv.FormatInt(randomness, 36)
-		xactID = fmt.Sprintf("%04s%02s", first4chars, last2chars)
-
-		if filePath == "" {
-			return
-		}
-		probeChunk := f.makeChunkName(filePath, 0, "", xactID)
-		_, probeErr := f.base.NewObject(ctx, probeChunk)
-		if probeErr != nil {
-			return
-		}
-	}
-
-	return "", fmt.Errorf("can't setup transaction for %s", filePath)
 }
 
 // List the objects and directories in dir into entries.
@@ -680,17 +591,18 @@ func (f *Fs) processEntries(ctx context.Context, origEntries fs.DirEntries, dirP
 	byRemote := make(map[string]*Object)
 	badEntry := make(map[string]bool)
 	isSubdir := make(map[string]bool)
+	isTemp := make(map[string]bool)
 
 	var tempEntries fs.DirEntries
 	for _, dirOrObject := range sortedEntries {
 		switch entry := dirOrObject.(type) {
 		case fs.Object:
 			remote := entry.Remote()
-			if mainRemote, chunkNo, ctrlType, xactID := f.parseChunkName(remote); mainRemote != "" {
-				if xactID != "" {
-					if revealHidden {
-						fs.Infof(f, "ignore temporary chunk %q", remote)
-					}
+			if mainRemote, chunkNo, ctrlType := f.parseChunkName(remote); mainRemote != "" {
+				if ctrlType == "status" {
+					// If a status control chunk is found for a remote then the remote is made
+					// up of temporary files which should be ignored
+					isTemp[mainRemote] = true
 					break
 				}
 				if ctrlType != "" {
@@ -747,6 +659,12 @@ func (f *Fs) processEntries(ctx context.Context, origEntries fs.DirEntries, dirP
 			}
 			if badEntry[remote] {
 				fs.Debugf(f, "invalid directory entry %q", remote)
+				continue
+			}
+			if isTemp[remote] {
+				if revealHidden {
+					fs.Infof(f, "ignore temporary chunks %q", remote)
+				}
 				continue
 			}
 			if err := object.validate(); err != nil {
@@ -836,8 +754,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		if !strings.Contains(entryRemote, remote) {
 			continue // bypass regexp to save cpu
 		}
-		mainRemote, chunkNo, ctrlType, xactID := f.parseChunkName(entryRemote)
-		if mainRemote == "" || mainRemote != remote || ctrlType != "" || xactID != "" {
+		mainRemote, chunkNo, ctrlType := f.parseChunkName(entryRemote)
+		//if a statatus control chunk is present then the object is made up of temporary chunks and should be ignored
+		if ctrlType == "status" {
+			return nil, fs.ErrorObjectNotFound
+		}
+		if mainRemote == "" || mainRemote != remote || ctrlType != "" {
 			continue // skip non-conforming, temporary and control chunks
 		}
 		//fs.Debugf(f, "%q belongs to %q as chunk %d", entryRemote, mainRemote, chunkNo)
@@ -928,9 +850,42 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 	}()
 
 	baseRemote := remote
-	xactID, errXact := f.newXactID(ctx, baseRemote)
-	if errXact != nil {
-		return nil, errXact
+	statusChunkName := f.makeChunkName(baseRemote, -1, "status")
+	var statusObject fs.Object
+	if err == nil {
+		statusInfo := f.wrapInfo(src, statusChunkName, 0)
+		var basePutErr error
+		statusObject, basePutErr = basePut(ctx, bytes.NewReader([]byte{}), statusInfo)
+		if basePutErr != nil {
+			return nil, basePutErr
+		}
+	}
+
+	// Gets a list of existing files in the directory
+	existingChunks := make(map[int]string) //map to keep track of existing chunks that are found (map is being used more like a set, but sets aren't supported in Go)
+	fs.Debugf(f, "Check value here:%b", f.opt.AttemptResume)
+	if f.opt.AttemptResume {
+		fs.Debugf(f, "Attempting Resume with chunker root:%s    base root:%s", f.Root(), f.base.Root())
+		entries, errList := f.base.List(ctx, "")
+		if errList != nil {
+			return nil, errList
+		}
+		fs.Debugf(f, "Number of existing files in directory:%d", entries.Len())
+		for i := 0; i < entries.Len(); i++ {
+			fileName := entries[i].String()
+			fileSize := entries[i].Size()
+			modTime := entries[i].ModTime(ctx)
+			parentFilePath, chunkNo, _ := f.parseChunkName(fileName) //can also get xactID here if needed
+			dt := src.ModTime(ctx).Sub(modTime)
+			modifyWindow := fs.GetModifyWindow(src.Fs(), f.base)
+
+			//checks if chunk belongs to equivalent file
+			//currently checks by name, size, and mod time
+			if parentFilePath == baseRemote && c.chunkSize == fileSize && dt < modifyWindow && dt > -modifyWindow {
+				existingChunks[chunkNo] = fileName
+			}
+		}
+
 	}
 
 	// Transfer chunks data
@@ -939,7 +894,7 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 			return nil, ErrChunkOverflow
 		}
 
-		tempRemote := f.makeChunkName(baseRemote, c.chunkNo, "", xactID)
+		tempRemote := f.makeChunkName(baseRemote, c.chunkNo, "")
 		size := c.sizeLeft
 		if size > c.chunkSize {
 			size = c.chunkSize
@@ -953,47 +908,69 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 		}
 		info := f.wrapInfo(src, chunkRemote, size)
 
-		// TODO: handle range/limit options
-		chunk, errChunk := basePut(ctx, wrapIn, info, options...)
-		if errChunk != nil {
-			return nil, errChunk
-		}
+		existingChunkPath := existingChunks[c.chunkNo]
+		var chunk fs.Object
+		// Checks if there was an existing chunk of this chunkNo found
+		// Existing chunk will be included if it exists, else the chunk will be uploaded
+		if existingChunkPath != "" && f.opt.AttemptResume {
+			fs.Debugf(f, "Chunk %d found. Skipping chunk...", c.chunkNo)
+			existingChunk, errExistingChunk := f.base.NewObject(ctx, existingChunkPath)
+			if errExistingChunk != nil {
+				return nil, errExistingChunk
+			}
+			chunk = existingChunk
 
-		if size > 0 && c.readCount == savedReadCount && c.expectSingle {
-			// basePut returned success but didn't call chunkingReader's Read.
-			// This is possible if wrapped remote has performed the put by hash
-			// because chunker bridges Hash from source for non-chunked files.
-			// Hence, force Read here to update accounting and hashsums.
+			// Need to force Read here to update accounting, hashsums, and advance the Reader for the skipped chunk
+			fs.Debugf(f, "SIZE FOR DUMMY READ:%d", size)
 			if err := c.dummyRead(wrapIn, size); err != nil {
 				return nil, err
 			}
-		}
-		if c.sizeLeft == 0 && !c.done {
-			// The file has been apparently put by hash, force completion.
-			c.done = true
-		}
 
-		// Expected a single chunk but more to come, so name it as usual.
-		if !c.done && chunkRemote != tempRemote {
-			fs.Infof(chunk, "Expected single chunk, got more")
-			chunkMoved, errMove := f.baseMove(ctx, chunk, tempRemote, delFailed)
-			if errMove != nil {
-				silentlyRemove(ctx, chunk)
-				return nil, errMove
+		} else {
+			// TODO: handle range/limit options
+			uploadedChunk, errChunk := basePut(ctx, wrapIn, info, options...)
+			if errChunk != nil {
+				return nil, errChunk
 			}
-			chunk = chunkMoved
-		}
+			chunk = uploadedChunk
 
-		// Wrapped remote may or may not have seen EOF from chunking reader,
-		// eg. the box multi-uploader reads exactly the chunk size specified
-		// and skips the "EOF" read. Hence, switch to next limit here.
-		if !(c.chunkLimit == 0 || c.chunkLimit == c.chunkSize || c.sizeTotal == -1 || c.done) {
-			silentlyRemove(ctx, chunk)
-			return nil, fmt.Errorf("Destination ignored %d data bytes", c.chunkLimit)
-		}
-		c.chunkLimit = c.chunkSize
+			if size > 0 && c.readCount == savedReadCount && c.expectSingle {
+				// basePut returned success but didn't call chunkingReader's Read.
+				// This is possible if wrapped remote has performed the put by hash
+				// because chunker bridges Hash from source for non-chunked files.
+				// Hence, force Read here to update accounting and hashsums.
+				if err := c.dummyRead(wrapIn, size); err != nil {
+					return nil, err
+				}
+			}
+			if c.sizeLeft == 0 && !c.done {
+				// The file has been apparently put by hash, force completion.
+				c.done = true
+			}
 
-		c.chunks = append(c.chunks, chunk)
+			// Expected a single chunk but more to come, so name it as usual.
+			if !c.done && chunkRemote != tempRemote {
+				fs.Infof(chunk, "Expected single chunk, got more")
+				chunkMoved, errMove := f.baseMove(ctx, chunk, tempRemote, delFailed)
+				if errMove != nil {
+					silentlyRemove(ctx, chunk)
+					return nil, errMove
+				}
+				chunk = chunkMoved
+			}
+
+			// Wrapped remote may or may not have seen EOF from chunking reader,
+			// eg. the box multi-uploader reads exactly the chunk size specified
+			// and skips the "EOF" read. Hence, switch to next limit here.
+			if !(c.chunkLimit == 0 || c.chunkLimit == c.chunkSize || c.sizeTotal == -1 || c.done) {
+				silentlyRemove(ctx, chunk)
+				return nil, fmt.Errorf("Destination ignored %d data bytes", c.chunkLimit)
+			}
+			c.chunkLimit = c.chunkSize
+
+			c.chunks = append(c.chunks, chunk)
+			fs.Debugf(f, "Added Chunk: %d", c.chunkNo)
+		}
 	}
 
 	// Validate uploaded size
@@ -1041,14 +1018,11 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 	// If previous object was chunked, remove its chunks
 	f.removeOldChunks(ctx, baseRemote)
 
-	// Rename data chunks from temporary to final names
-	for chunkNo, chunk := range c.chunks {
-		chunkRemote := f.makeChunkName(baseRemote, chunkNo, "", "")
-		chunkMoved, errMove := f.baseMove(ctx, chunk, chunkRemote, delFailed)
-		if errMove != nil {
-			return nil, errMove
-		}
-		c.chunks[chunkNo] = chunkMoved
+	// Remove status control chunk to signify file was successfully uploaded
+	// Must return an error if we fail to remove the status control chunk because then the chunks will
+	// permanently be treated as temporary chunks
+	if err := statusObject.Remove(ctx); err != nil {
+		return nil, err
 	}
 
 	if !f.useMeta {
@@ -1199,7 +1173,7 @@ func (c *chunkingReader) accountBytes(bytesRead int64) {
 
 // dummyRead updates accounting, hashsums etc by simulating reads
 func (c *chunkingReader) dummyRead(in io.Reader, size int64) error {
-	if c.hasher == nil && c.readCount+size > maxMetadataSize {
+	if c.hasher == nil && c.readCount+size > maxMetadataSize && !c.fs.opt.AttemptResume { //TODO: Added "&& !f.opt.AttemptResume" so that full dummy read would always occur, but need to investigate furhter why this if statement was here and if there could be confilicts with this change
 		c.accountBytes(size)
 		return nil
 	}
@@ -1210,7 +1184,7 @@ func (c *chunkingReader) dummyRead(in io.Reader, size int64) error {
 		if n > bufLen {
 			n = bufLen
 		}
-		if _, err := io.ReadFull(in, buf[0:n]); err != nil {
+		if _, err := io.ReadFull(in, buf[0:n]); err != nil { // TODO: time intensive for skipping existing chunks
 			return err
 		}
 		size -= n
@@ -1687,10 +1661,11 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 		return
 	}
 	wrappedNotifyFunc := func(path string, entryType fs.EntryType) {
-		//fs.Debugf(f, "ChangeNotify: path %q entryType %d", path, entryType)
 		if entryType == fs.EntryObject {
-			mainPath, _, _, xactID := f.parseChunkName(path)
-			if mainPath != "" && xactID == "" {
+			mainPath, _, _ := f.parseChunkName(path)
+			statusChunkPath := f.makeChunkName(mainPath, -1, "status")
+			// Checks the path for a status chunk that would indicate this is a temporary chunk
+			if _, err := f.base.NewObject(ctx, statusChunkPath); mainPath != "" && err != fs.ErrorObjectNotFound {
 				path = mainPath
 			}
 		}
