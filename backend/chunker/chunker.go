@@ -862,7 +862,6 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote st
 
 	// Gets a list of existing files in the directory
 	existingChunks := make(map[int]string) //map to keep track of existing chunks that are found (map is being used more like a set, but sets aren't supported in Go)
-	fs.Debugf(f, "Check value here:%b", f.opt.AttemptResume)
 	if f.opt.AttemptResume {
 		fs.Debugf(f, "Attempting Resume with chunker root:%s    base root:%s", f.Root(), f.base.Root())
 		entries, errList := f.base.List(ctx, "")
