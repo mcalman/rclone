@@ -839,9 +839,11 @@ func (o *Object) readMetadata(ctx context.Context) error {
 
 // put implements Put, PutStream, PutUnchecked, Update
 func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options []fs.OpenOption, basePut putFn) (obj fs.Object, err error) {
+	fs.Debugf(f, "This is chunker put")
 	c := f.newChunkingReader(src)
+	fs.Debugf(f, "This is chunker put (before wrapstream)")
 	wrapIn := c.wrapStream(ctx, in, src)
-
+	fs.Debugf(f, "This is chunker put (after wrapstream)")
 	var metaObject fs.Object
 	defer func() {
 		if err != nil {
@@ -1092,7 +1094,9 @@ func (c *chunkingReader) wrapStream(ctx context.Context, in io.Reader, src fs.Ob
 
 	switch {
 	case c.fs.useMD5:
+		fs.Debugf("", "Using MD5")
 		if c.md5, _ = src.Hash(ctx, hash.MD5); c.md5 == "" {
+			fs.Debugf("", "c.md5==''")
 			if c.fs.hashFallback {
 				c.sha1, _ = src.Hash(ctx, hash.SHA1)
 			} else {
@@ -1118,6 +1122,7 @@ func (c *chunkingReader) wrapStream(ctx context.Context, in io.Reader, src fs.Ob
 
 func (c *chunkingReader) updateHashes() {
 	if c.hasher == nil {
+		fs.Debugf("", "Does not update Hash")
 		return
 	}
 	switch {
@@ -1219,6 +1224,7 @@ func (f *Fs) removeOldChunks(ctx context.Context, remote string) {
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	fs.Debugf(f, "This is chunker Put")
 	if err := f.forbidChunk(src, src.Remote()); err != nil {
 		return nil, errors.Wrap(err, "refusing to put")
 	}
@@ -1388,6 +1394,7 @@ func (o *Object) Remove(ctx context.Context) (err error) {
 
 // copyOrMove implements copy or move
 func (f *Fs) copyOrMove(ctx context.Context, o *Object, remote string, do copyMoveFn, md5, sha1, opName string) (fs.Object, error) {
+	fs.Debugf(f, "This is chunker copyOrMove")
 	if err := f.forbidChunk(o, remote); err != nil {
 		return nil, errors.Wrapf(err, "can't %s", opName)
 	}
@@ -1534,6 +1541,7 @@ func (f *Fs) okForServerSide(ctx context.Context, src fs.Object, opName string) 
 //
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	fs.Debugf(f, "This is chunker Copy")
 	baseCopy := f.base.Features().Copy
 	if baseCopy == nil {
 		return nil, fs.ErrorCantCopy
