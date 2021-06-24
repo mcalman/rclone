@@ -8,11 +8,14 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -229,6 +232,7 @@ type Fs struct {
 	precision   time.Duration       // precision of local filesystem
 	warnedMu    sync.Mutex          // used for locking access to 'warned'.
 	warned      map[string]struct{} // whether we have warned about this string
+	hashState   map[string]string   // set in resume(), used to restore hash state
 
 	// do os.Lstat or os.Stat
 	lstat        func(name string) (os.FileInfo, error)
@@ -266,11 +270,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	f := &Fs{
-		name:   name,
-		opt:    *opt,
-		warned: make(map[string]struct{}),
-		dev:    devUnset,
-		lstat:  os.Lstat,
+		name:      name,
+		opt:       *opt,
+		warned:    make(map[string]struct{}),
+		hashState: make(map[string]string),
+		dev:       devUnset,
+		lstat:     os.Lstat,
 	}
 	f.root = cleanRootPath(root, f.opt.NoUNC, f.opt.Enc)
 	f.features = (&fs.Features{
@@ -1115,6 +1120,7 @@ func (nwc nopWriterCloser) Close() error {
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	var out io.WriteCloser
 	var hasher *hash.MultiHasher
+	var resumeOpt *fs.OptionResume
 
 	for _, option := range options {
 		switch x := option.(type) {
@@ -1122,6 +1128,24 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			if x.Hashes.Count() > 0 {
 				hasher, err = hash.NewMultiHasherTypes(x.Hashes)
 				if err != nil {
+					return err
+				}
+			}
+		case *fs.OptionResume:
+			resumeOpt = option.(*fs.OptionResume)
+			if resumeOpt.Pos != 0 {
+				fs.Logf(o, "Resuming at byte position: %d", resumeOpt.Pos)
+				// Discard bytes that already exist on backend
+				_, err := io.CopyN(ioutil.Discard, in, resumeOpt.Pos)
+				if err != nil {
+					return err
+				}
+				hashType := o.fs.Hashes().GetOne()
+				hasher, err = hash.NewMultiHasherTypes(hash.NewHashSet(hashType))
+				if err != nil {
+					return err
+				}
+				if err := hasher.RestoreHashState(hashType, o.fs.hashState[o.remote]); err != nil {
 					return err
 				}
 			}
@@ -1138,7 +1162,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// If it is a translated link, just read in the contents, and
 	// then create a symlink
 	if !o.translatedLink {
-		f, err := file.OpenFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+		var f *os.File
+		if resumeOpt != nil && resumeOpt.Pos != 0 {
+			f, err = file.OpenFile(o.path, os.O_WRONLY|os.O_APPEND, 0666)
+		} else {
+			f, err = file.OpenFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+		}
 		if err != nil {
 			if runtime.GOOS == "windows" && os.IsPermission(err) {
 				// If permission denied on Windows might be trying to update a
@@ -1152,7 +1181,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				return err
 			}
 		}
-		if !o.fs.opt.NoPreAllocate {
+		if !o.fs.opt.NoPreAllocate && resumeOpt != nil && resumeOpt.Pos == 0 {
 			// Pre-allocate the file for performance reasons
 			err = file.PreAllocate(src.Size(), f)
 			if err != nil {
@@ -1173,7 +1202,43 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		in = io.TeeReader(in, hasher)
 	}
 
-	_, err = io.Copy(out, in)
+	// Trap SIGINT, SIGHUP and SIGTERM to save upload state to resume cache
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM)
+	var wg sync.WaitGroup
+	// Context for read so that we can handle io.copy being interrupted
+	ctxr, cancel := context.WithCancel(ctx) // context.Background()
+	go func() {
+		for {
+			s := <-c
+			if s == syscall.SIGINT || s == syscall.SIGHUP || s == syscall.SIGTERM {
+				// If OptionResume was passed, call SetID to prepare for future resumes
+				// ID is the number of bytes written to the destination
+				if resumeOpt != nil {
+					// Stops the copy so cache is consistent with remote
+					wg.Add(1)
+					cancel()
+					fs.Infof(o, "Updating resume cache")
+					fileInfo, _ := o.fs.lstat(o.path)
+					writtenStr := strconv.FormatInt(fileInfo.Size(), 10)
+					hashType := o.fs.Hashes().GetOne()
+					hashState, err := hasher.GetHashState(hashType)
+					if err != nil {
+						os.Exit(1)
+					}
+					_ = resumeOpt.SetID(writtenStr, hashType.String(), hashState)
+				}
+				os.Exit(1)
+			}
+		}
+	}()
+	cr := readers.NewContextReader(ctxr, in)
+	_, err = io.Copy(out, cr)
+	if errors.Is(err, context.Canceled) {
+		// If resume data is being written we want to wait here for the program to exit
+		wg.Wait()
+	}
+
 	closeErr := out.Close()
 	if err == nil {
 		err = closeErr
@@ -1338,9 +1403,44 @@ func cleanRootPath(s string, noUNC bool, enc encoder.MultiEncoder) string {
 	return s
 }
 
+// Resume checks whether the (remote, ID) pair is valid and returns
+// the point the file should be resumed from or an error.
+func (f *Fs) Resume(ctx context.Context, remote, ID, hashName, hashState string) (Pos int64, err error) {
+	cachedPos, err := strconv.ParseInt(ID, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	// Compare hash of partial file on remote with partial hash in cache
+	remoteObject, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return 0, err
+	}
+	if remoteObject.Size() != cachedPos {
+		return 0, errors.New("size on remote does not match resume cache")
+	}
+	hashType := hash.HashNameToType(hashName)
+	remoteHash, err := remoteObject.Hash(ctx, hashType)
+	if err != nil {
+		return 0, err
+	}
+	cachedHash, err := hash.SumPartialHash(hashName, hashState)
+	if err != nil {
+		return 0, err
+	}
+	// Hashes match, attempt resume
+	if cachedHash == remoteHash {
+		f.hashState[remote] = hashState
+		return cachedPos, nil
+	}
+	// No valid position found, restart from beginning
+	fs.Debugf(f, "Cached hash state did not match hash state on remote")
+	return 0, nil
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs             = &Fs{}
+	_ fs.Resumer        = &Fs{}
 	_ fs.Purger         = &Fs{}
 	_ fs.PutStreamer    = &Fs{}
 	_ fs.Mover          = &Fs{}

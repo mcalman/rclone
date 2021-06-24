@@ -23,7 +23,9 @@ func createResumeOpt(ctx context.Context, f fs.Fs, remote string, src fs.Object)
 		if attemptResume {
 			fs.Debugf(f, "Existing resume cache file found: %s. A resume will now be attmepted.", cacheName)
 			position, resumeErr := f.Features().Resume(ctx, remote, resumeID, hashName, hashState)
-			if resumeErr == nil && position > int64(ci.ResumeLarger) {
+			if resumeErr != nil {
+				fs.Errorf(src, "Resume canceled: %v", resumeErr)
+			} else if position > int64(ci.ResumeLarger) {
 				(*resumeOpt).Pos = position
 			}
 		}
