@@ -297,8 +297,8 @@ func SumPartialHash(hashName, hashState string) (string, error) {
 	return hex.EncodeToString(partialHash.Sum(nil)), nil
 }
 
-// HashNameToType returns the requested hash type or None if the hash type isn't supported
-func HashNameToType(hashName string) Type {
+// NameToType returns the requested hash type or None if the hash type isn't supported
+func NameToType(hashName string) Type {
 	hashDef, ok := name2hash[hashName]
 	if !ok {
 		return None
