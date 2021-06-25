@@ -1414,7 +1414,7 @@ func (f *Fs) Resume(ctx context.Context, remote, ID, hashName, hashState string)
 	if remoteObject.Size() != cachedPos {
 		return 0, errors.New("size on remote does not match resume cache")
 	}
-	hashType := hash.HashNameToType(hashName)
+	hashType := hash.NameToType(hashName)
 	remoteHash, err := remoteObject.Hash(ctx, hashType)
 	if err != nil {
 		return 0, err

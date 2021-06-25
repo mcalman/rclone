@@ -22,8 +22,8 @@ import (
 type interruptReader struct{}
 
 func (r *interruptReader) Read(b []byte) (n int, err error) {
-	syscall.Kill(syscall.Getpid(), syscall.SIGINT)
-	return 0, nil
+	err = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+	return 0, err
 }
 
 // this is a wrapper for a mockobject with a custom Open function
@@ -108,7 +108,9 @@ func TestResume(t *testing.T) {
 		remoteRoot := os.Getenv("REMOTEROOT")
 		remoteFs, err := fs.NewFs(ctx, remoteRoot)
 		require.NoError(t, err)
-		Copy(ctx, remoteFs, nil, "testdst", srcBreak)
+		_, _ = Copy(ctx, remoteFs, nil, "testdst", srcBreak)
+		// This should never be reached as the subroutine should exit during Copy
+		require.True(t, false, "Problem with test, first Copy operation should've been interrupted before completion")
 		return
 	}
 	// Start the subprocess
