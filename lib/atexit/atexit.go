@@ -46,12 +46,12 @@ func Register(fn func()) FnHandle {
 			if sig == nil {
 				return
 			}
-			signal.Stop(exitChan)
+			//signal.Stop(exitChan)
 			atomic.StoreInt32(&signalled, 1)
 			fs.Infof(nil, "Signal received: %s", sig)
 			Run()
 			fs.Infof(nil, "Exiting...")
-			os.Exit(0)
+			os.Exit(1)
 		}()
 	})
 
