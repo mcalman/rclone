@@ -8,14 +8,12 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"os/signal"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -27,6 +25,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/lib/readers"
@@ -1202,41 +1201,39 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		in = io.TeeReader(in, hasher)
 	}
 
-	// Trap SIGINT, SIGHUP and SIGTERM to save upload state to resume cache
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM)
-	var wg sync.WaitGroup
+	var cacheingWg sync.WaitGroup // Used to halt code execution while resume cache is written
+	var copyWg sync.WaitGroup     // Ensure that io.Copy has returned before writing resume data
+	copyWg.Add(1)
 	// Context for read so that we can handle io.copy being interrupted
-	ctxr, cancel := context.WithCancel(ctx) // context.Background()
-	go func() {
-		for {
-			s := <-c
-			if s == syscall.SIGINT || s == syscall.SIGHUP || s == syscall.SIGTERM {
-				// If OptionResume was passed, call SetID to prepare for future resumes
-				// ID is the number of bytes written to the destination
-				if resumeOpt != nil {
-					// Stops the copy so cache is consistent with remote
-					wg.Add(1)
-					cancel()
-					fs.Infof(o, "Updating resume cache")
-					fileInfo, _ := o.fs.lstat(o.path)
-					writtenStr := strconv.FormatInt(fileInfo.Size(), 10)
-					hashType := o.fs.Hashes().GetOne()
-					hashState, err := hasher.GetHashState(hashType)
-					if err != nil {
-						os.Exit(1)
-					}
-					_ = resumeOpt.SetID(writtenStr, hashType.String(), hashState)
-				}
-				os.Exit(1)
+	ctxr, cancel := context.WithCancel(ctx)
+	// Create exit handler during Copy so that resume data can be written if interrupted
+	atexitHandle := atexit.Register(func() {
+		// If OptionResume was passed, call SetID to prepare for future resumes
+		// ID is the number of bytes written to the destination
+		if resumeOpt != nil {
+			// Stops the copy so cache is consistent with remote
+			cacheingWg.Add(1)
+			cancel()
+			copyWg.Wait()
+			fs.Infof(o, "Updating resume cache")
+			fileInfo, _ := o.fs.lstat(o.path)
+			writtenStr := strconv.FormatInt(fileInfo.Size(), 10)
+			hashType := o.fs.Hashes().GetOne()
+			hashState, err := hasher.GetHashState(hashType)
+			if err != nil {
+				return
 			}
+			_ = resumeOpt.SetID(writtenStr, hashType.String(), hashState)
 		}
-	}()
+		return
+	})
 	cr := readers.NewContextReader(ctxr, in)
 	_, err = io.Copy(out, cr)
+	copyWg.Done()
+	atexit.Unregister(atexitHandle)
 	if errors.Is(err, context.Canceled) {
 		// If resume data is being written we want to wait here for the program to exit
-		wg.Wait()
+		cacheingWg.Wait()
 	}
 
 	closeErr := out.Close()
