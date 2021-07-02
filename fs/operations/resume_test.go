@@ -22,7 +22,11 @@ import (
 type interruptReader struct{}
 
 func (r *interruptReader) Read(b []byte) (n int, err error) {
-	err = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+	p, err := os.FindProcess(syscall.Getpid())
+	if err != nil {
+		return 0, err
+	}
+	err = p.Signal(os.Interrupt)
 	return 0, err
 }
 
