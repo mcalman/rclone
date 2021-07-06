@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
@@ -22,11 +21,12 @@ import (
 type interruptReader struct{}
 
 func (r *interruptReader) Read(b []byte) (n int, err error) {
-	p, err := os.FindProcess(syscall.Getpid())
-	if err != nil {
-		return 0, err
-	}
-	err = p.Signal(os.Interrupt)
+	// p, err := os.FindProcess(syscall.Getpid())
+	// if err != nil {
+	// 	return 0, err
+	// }
+	// err = p.Signal(os.Interrupt)
+	err = sendInterrupt()
 	return 0, err
 }
 
@@ -121,6 +121,7 @@ func TestResume(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestResume")
 	cmd.Env = append(os.Environ(), "RUNTEST=1", "REMOTEROOT="+r.Fremote.Root())
 	cmd.Stdout = os.Stdout
+	setupCmd(cmd)
 	err := cmd.Run()
 
 	e, ok := err.(*exec.ExitError)
