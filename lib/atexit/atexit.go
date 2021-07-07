@@ -5,6 +5,7 @@
 package atexit
 
 import (
+	"fmt"
 	"os"
 	"os/signal"
 	"sync"
@@ -46,10 +47,16 @@ func Register(fn func()) FnHandle {
 			if sig == nil {
 				return
 			}
-			//signal.Stop(exitChan)
+			fmt.Print(" STOPPING")
+			fs.Infof(nil, "Stopping...")
+			signal.Stop(exitChan)
+			fmt.Print(" STOPPED")
+			fs.Infof(nil, "stopped...")
 			atomic.StoreInt32(&signalled, 1)
 			fs.Infof(nil, "Signal received: %s", sig)
+			fmt.Print("SIGNAL RECIEVED")
 			Run()
+			fmt.Print(" EXITING")
 			fs.Infof(nil, "Exiting...")
 			os.Exit(1)
 		}()

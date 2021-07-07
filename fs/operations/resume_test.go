@@ -9,25 +9,34 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/mockobject"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type interruptReader struct{}
 
+// Read sends an OS specific interrupt signal, waits for the TODO: finish
 func (r *interruptReader) Read(b []byte) (n int, err error) {
-	// p, err := os.FindProcess(syscall.Getpid())
-	// if err != nil {
-	// 	return 0, err
-	// }
-	// err = p.Signal(os.Interrupt)
+	var wg sync.WaitGroup
+	wg.Add(1)
 	err = sendInterrupt()
-	return 0, err
+	go func() {
+		for {
+			if atexit.Signalled() {
+				wg.Done()
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	return 0, context.Canceled
 }
 
 // this is a wrapper for a mockobject with a custom Open function
@@ -127,7 +136,7 @@ func TestResume(t *testing.T) {
 	e, ok := err.(*exec.ExitError)
 
 	expectedErrorString := "exit status 1"
-	assert.Equal(t, true, ok)
+	assert.True(t, ok)
 	assert.Equal(t, expectedErrorString, e.Error())
 
 	var buf bytes.Buffer
