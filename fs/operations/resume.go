@@ -6,7 +6,9 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
@@ -18,7 +20,16 @@ func createResumeOpt(ctx context.Context, f fs.Fs, remote string, src fs.Object)
 	ci := fs.GetConfig(ctx)
 	resumeOpt = &fs.OptionResume{ID: "", Pos: 0, SetID: createSetID(ctx, f, remote, src)}
 	if ci.ResumeLarger >= 0 {
-		cacheName := filepath.Join(config.CacheDir, "resume", f.Name(), f.Root(), remote)
+		root := f.Root()
+		if runtime.GOOS == "windows" {
+			if root[:4] == "//?/" {
+				root = root[4:]
+			}
+			if root[1] == ':' {
+				root = strings.Replace(root, ":", "", 1)
+			}
+		}
+		cacheName := filepath.Join(config.CacheDir, "resume", f.Name(), root, remote)
 		resumeID, hashName, hashState, attemptResume := readResumeCache(ctx, f, src, cacheName)
 		if attemptResume {
 			fs.Debugf(f, "Existing resume cache file found: %s. A resume will now be attmepted.", cacheName)
@@ -51,8 +62,17 @@ func createSetID(ctx context.Context, f fs.Fs, remote string, src fs.Object) fun
 			return errors.Wrapf(err, "failed to marshal data JSON")
 		}
 		if len(data) < int(ci.MaxResumeCacheSize) {
-			// Each remote will have its own dir for cached resume files
-			dirPath := filepath.Join(rootCacheDir, f.Name(), f.Root())
+			// Each remote will have its own directory for cached resume files
+			root := f.Root()
+			if runtime.GOOS == "windows" {
+				if root[:4] == "//?/" {
+					root = root[4:]
+				}
+				if root[1] == ':' {
+					root = strings.Replace(root, ":", "", 1)
+				}
+			}
+			dirPath := filepath.Join(rootCacheDir, f.Name(), root)
 			err = os.MkdirAll(dirPath, os.ModePerm)
 			if err != nil {
 				return errors.Wrapf(err, "failed to create cache directory %v", dirPath)

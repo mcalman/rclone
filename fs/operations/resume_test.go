@@ -27,6 +27,9 @@ func (r *interruptReader) Read(b []byte) (n int, err error) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	err = sendInterrupt()
+	if err != nil {
+		return 0, err
+	}
 	go func() {
 		for {
 			if atexit.Signalled() {

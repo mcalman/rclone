@@ -1221,7 +1221,6 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			}
 			_ = resumeOpt.SetID(writtenStr, hashType.String(), hashState)
 		}
-		return
 	})
 	cr := readers.NewContextReader(ctxr, in)
 	_, err = io.Copy(out, cr)

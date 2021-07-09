@@ -19,5 +19,4 @@ func sendInterrupt() error {
 
 func setupCmd(cmd *exec.Cmd) {
 	// Only needed for windows
-	return
 }

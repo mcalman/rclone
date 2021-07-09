@@ -9,10 +9,6 @@ import (
 
 // Credit: https://github.com/golang/go/blob/6125d0c4265067cdb67af1340bf689975dd128f4/src/os/signal/signal_windows_test.go#L18
 func sendInterrupt() error {
-	// pid, err := os.FindProcess(syscall.Getpid())
-	// if err != nil {
-	// 	return err
-	// }
 	d, e := syscall.LoadDLL("kernel32.dll")
 	if e != nil {
 		return e
@@ -32,5 +28,4 @@ func setupCmd(cmd *exec.Cmd) {
 	(*cmd).SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
-	return
 }
