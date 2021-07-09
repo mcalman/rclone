@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -139,9 +140,13 @@ func TestResume(t *testing.T) {
 
 	e, ok := err.(*exec.ExitError)
 
+	// Exit code after signal will be (128+signum) on Linux or (signum) on Windows
 	expectedErrorString := "exit status 1"
+	if runtime.GOOS == "windows" {
+		expectedErrorString = "exit status 2"
+	}
 	assert.True(t, ok)
-	assert.Equal(t, expectedErrorString, e.Error())
+	assert.Contains(t, e.Error(), expectedErrorString)
 
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
@@ -154,7 +159,7 @@ func TestResume(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Checks to see if a resume was initiated
-	assert.True(t, strings.Contains(buf.String(), "Resuming at byte position: 2"), "The upload did not resume when restarted.")
+	assert.True(t, strings.Contains(buf.String(), "Resuming at byte position: 2"), "The upload did not resume when restarted. Message: %q", buf.String())
 
 	checkContents(newDst, string(expectedContents))
 }
