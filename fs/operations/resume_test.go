@@ -9,21 +9,38 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
+	"sync"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/mockobject"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type interruptReader struct{}
 
+// Read sends an OS specific interrupt signal, waits for the signal to be
+// received, and then simulates read being cancelled
 func (r *interruptReader) Read(b []byte) (n int, err error) {
-	err = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
-	return 0, err
+	var wg sync.WaitGroup
+	wg.Add(1)
+	err = sendInterrupt()
+	if err != nil {
+		return 0, err
+	}
+	go func() {
+		for {
+			if atexit.Signalled() {
+				wg.Done()
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	return 0, context.Canceled
 }
 
 // this is a wrapper for a mockobject with a custom Open function
@@ -117,12 +134,13 @@ func TestResume(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestResume")
 	cmd.Env = append(os.Environ(), "RUNTEST=1", "REMOTEROOT="+r.Fremote.Root())
 	cmd.Stdout = os.Stdout
+	setupCmd(cmd)
 	err := cmd.Run()
 
 	e, ok := err.(*exec.ExitError)
 
 	expectedErrorString := "exit status 1"
-	assert.Equal(t, true, ok)
+	assert.True(t, ok)
 	assert.Equal(t, expectedErrorString, e.Error())
 
 	var buf bytes.Buffer
