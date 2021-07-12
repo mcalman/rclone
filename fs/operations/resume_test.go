@@ -80,7 +80,7 @@ func TestResume(t *testing.T) {
 	// Contents for the mock object
 	var (
 		// Test contents must be large enough that io.Copy does not complete during the first Rclone Copy operation
-		resumeTestContents = makeContent(t, 64)
+		resumeTestContents = makeContent(t, 1024)
 		expectedContents   = resumeTestContents
 	)
 
