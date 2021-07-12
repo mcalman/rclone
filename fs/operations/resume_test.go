@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
@@ -34,6 +35,9 @@ func (r *interruptReader) Read(b []byte) (n int, err error) {
 	buffer := make([]byte, 1)
 	n, err = r.r.Read(buffer)
 	b[0] = buffer[0]
+	// Simulate duration of a larger read without needing to test with a large file
+	// Allows for the interrupt to be handled before Copy completes
+	time.Sleep(time.Microsecond * 10)
 	return n, err
 }
 
