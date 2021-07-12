@@ -1223,7 +1223,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			if err != nil {
 				return
 			}
-			_ = resumeOpt.SetID(writtenStr, hashType.String(), hashState)
+			_ = resumeOpt.SetID(ctx, writtenStr, hashType.String(), hashState)
 		}
 	})
 	cr := readers.NewContextReader(ctxr, in)

@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"runtime"
@@ -16,66 +17,57 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/mockobject"
-	"github.com/rclone/rclone/lib/atexit"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-type interruptReader struct{}
+type interruptReader struct {
+	once sync.Once
+	r    io.Reader
+}
 
-// Read sends an OS specific interrupt signal, waits for the signal to be
-// received, and then simulates read being cancelled
+// Read sends an OS specific interrupt signal and then reads 1 byte at a time
 func (r *interruptReader) Read(b []byte) (n int, err error) {
-	var wg sync.WaitGroup
-	wg.Add(1)
-	err = sendInterrupt()
-	if err != nil {
-		return 0, err
-	}
-	go func() {
-		for {
-			if atexit.Signalled() {
-				wg.Done()
-				return
-			}
-		}
-	}()
-	wg.Wait()
-	return 0, context.Canceled
+	r.once.Do(func() {
+		_ = sendInterrupt()
+	})
+	buffer := make([]byte, 1)
+	n, err = r.r.Read(buffer)
+	b[0] = buffer[0]
+	return n, err
 }
 
 // this is a wrapper for a mockobject with a custom Open function
 //
-// breaks indicate the number of bytes to read before sending an
+// n indicates the number of bytes to read before sending an
 // interrupt signal
 type resumeTestObject struct {
 	fs.Object
-	breaks []int64
+	n int64
 }
 
 // Open opens the file for read. Call Close() on the returned io.ReadCloser
 //
-// This will signal an interrupt after reading the number of bytes in breaks
+// The Reader will signal an interrupt after reading n bytes, then continue to read 1 byte at a time.
+// If TestResume is successful, the interrupt will be processed and reads will be cancelled before running
+// out of bytes to read
 func (o *resumeTestObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	rc, err := o.Object.Open(ctx, options...)
 	if err != nil {
 		return nil, err
 	}
-	if len(o.breaks) > 0 {
-		// Pop a breakpoint off
-		N := o.breaks[0]
-		o.breaks = o.breaks[1:]
-		// If 0 then return an error immediately
-		if N == 0 {
-			return nil, errorTestError
-		}
-		// Read N bytes then an error
-		var ir interruptReader
-		r := io.MultiReader(&io.LimitedReader{R: rc, N: N}, &ir)
-		// Wrap with Close in a new readCloser
-		rc = readCloser{Reader: r, Closer: rc}
-	}
+	r := io.MultiReader(&io.LimitedReader{R: rc, N: o.n}, &interruptReader{r: rc})
+	// Wrap with Close in a new readCloser
+	rc = readCloser{Reader: r, Closer: rc}
 	return rc, nil
+}
+
+func makeContent(t *testing.T, size int) []byte {
+	content := make([]byte, size)
+	r := rand.New(rand.NewSource(42))
+	_, err := io.ReadFull(r, content)
+	assert.NoError(t, err)
+	return content
 }
 
 func TestResume(t *testing.T) {
@@ -87,17 +79,18 @@ func TestResume(t *testing.T) {
 
 	// Contents for the mock object
 	var (
-		resumeTestContents = []byte("0123456789")
+		// Test contents must be large enough that io.Copy does not complete during the first Rclone Copy operation
+		resumeTestContents = makeContent(t, 64)
 		expectedContents   = resumeTestContents
 	)
 
 	// Create mockobjects with given breaks
-	createTestSrc := func(breaks []int64) (fs.Object, fs.Object) {
+	createTestSrc := func(interrupt int64) (fs.Object, fs.Object) {
 		srcOrig := mockobject.New("potato").WithContent(resumeTestContents, mockobject.SeekModeNone)
 		srcOrig.SetFs(r.Flocal)
 		src := &resumeTestObject{
 			Object: srcOrig,
-			breaks: breaks,
+			n:      interrupt,
 		}
 		return src, srcOrig
 	}
@@ -118,7 +111,7 @@ func TestResume(t *testing.T) {
 		_ = r.Close()
 	}
 
-	srcBreak, srcNoBreak := createTestSrc([]int64{2})
+	srcBreak, srcNoBreak := createTestSrc(2)
 
 	// Run first Copy only in a subprocess so that it can be interrupted without ending the test
 	// adapted from: https://stackoverflow.com/questions/26225513/how-to-test-os-exit-scenarios-in-go
@@ -159,7 +152,8 @@ func TestResume(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Checks to see if a resume was initiated
-	assert.True(t, strings.Contains(buf.String(), "Resuming at byte position: 2"), "The upload did not resume when restarted. Message: %q", buf.String())
+	// Resumed byte position can vary slightly depending how long it takes atexit to process the interrupt
+	assert.True(t, strings.Contains(buf.String(), "Resuming at byte position: "), "The upload did not resume when restarted. Message: %q", buf.String())
 
 	checkContents(newDst, string(expectedContents))
 }
