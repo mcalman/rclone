@@ -252,19 +252,19 @@ type OptionResume struct {
 //
 // SetID takes the passed resume ID, hash state, hash name and Fingerprint of the object and stores it in
 // --cache-dir so that future Copy operations can resume the upload if it fails
-func (opt *OptionResume) SetID(ctx context.Context, ID, hashName, hashState string) error {
+func (o *OptionResume) SetID(ctx context.Context, ID, hashName, hashState string) error {
 	ci := GetConfig(ctx)
-	rootCacheDir := filepath.Join(opt.CacheDir, "resume")
+	rootCacheDir := filepath.Join(o.CacheDir, "resume")
 	// Get the Fingerprint of the src object so that future Copy operations can ensure the
 	// object hasn't changed before resuming an upload
-	fingerprint := Fingerprint(ctx, opt.Src, true)
+	fingerprint := Fingerprint(ctx, o.Src, true)
 	data, err := marshalResumeJSON(ctx, fingerprint, ID, hashName, hashState)
 	if err != nil {
 		return errors.Wrapf(err, "failed to marshal data JSON")
 	}
 	if len(data) < int(ci.MaxResumeCacheSize) {
 		// Each remote will have its own directory for cached resume files
-		root := opt.F.Root()
+		root := o.F.Root()
 		if runtime.GOOS == "windows" {
 			if root[:4] == "//?/" {
 				root = root[4:]
@@ -273,13 +273,13 @@ func (opt *OptionResume) SetID(ctx context.Context, ID, hashName, hashState stri
 				root = strings.Replace(root, ":", "", 1)
 			}
 		}
-		dirPath := filepath.Join(rootCacheDir, opt.F.Name(), root)
+		dirPath := filepath.Join(rootCacheDir, o.F.Name(), root)
 		err = os.MkdirAll(dirPath, os.ModePerm)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create cache directory %v", dirPath)
 		}
 		// Write resume data to disk
-		cachePath := filepath.Join(dirPath, opt.Remote)
+		cachePath := filepath.Join(dirPath, o.Remote)
 		cacheFile, err := os.Create(cachePath)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create cache file %v", cachePath)
@@ -292,16 +292,16 @@ func (opt *OptionResume) SetID(ctx context.Context, ID, hashName, hashState stri
 			return errors.Wrapf(errWrite, "failed to write JSON to file")
 		}
 	}
-	if !opt.CacheCleaned {
+	if !o.CacheCleaned {
 		if err := cleanResumeCache(ctx, rootCacheDir); err != nil {
 			return errors.Wrapf(err, "failed to clean resume cache")
 		}
 	}
-	opt.CacheCleaned = true
+	o.CacheCleaned = true
 	return nil
 }
 
-// Struct for storing resume info in cache
+// ResumeJSON is a struct for storing resume info in cache
 type ResumeJSON struct {
 	Fingerprint string `json:"fprint"`
 	ID          string `json:"id"`
